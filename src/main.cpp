@@ -1,25 +1,36 @@
 // ============================================================
 //  main.cpp
-//  Entry point for the haptic feedback sleeve on Raspberry Pi Zero 2 W.
+//  Entry point for the haptic feedback sleeve.
+//  Raspberry Pi Zero 2 W + PCA9685 + ULN2803A + 12 ERM motors.
 //
 //  Dependency chain (each file includes the one above it):
-//    AudioEngine.cpp  — DSP filtering        -> FilterOutput
-//    Mappers.cpp      — mode logic            -> MotorCommand (float intensity)
+//    AudioEngine.cpp  — DSP filtering         -> FilterOutput
+//    Mappers.cpp      — BandMapper/DirectMapper -> MotorCommand
 //    MotorControl.cpp — PCA9685 I2C PWM driver
-//    main.cpp         — PortAudio capture, threading, mode switching
+//    Buttons.cpp      — GPIO button polling thread
+//    main.cpp         — PortAudio capture, main loop, mode switching
 //
-//  Install dependencies on Pi:
+//  Install dependencies:
 //    sudo apt install libportaudio2 portaudio19-dev libi2c-dev
 //    sudo raspi-config -> Interface Options -> I2C -> Enable
+//    sudo usermod -aG gpio $USER   (then log out and back in)
 //
 //  Compile:
-//    g++ -std=c++17 -O2 -o HapticSleeve main.cpp -li2c -lportaudio -lm
+//    g++ -std=c++17 -O2 -o HapticSleeve main.cpp \
+//        -li2c -lportaudio -lgpiod -lm
 //
 //  Run:
 //    ./HapticSleeve
+//
+//  First-run checklist:
+//    1. i2cdetect -y 1       <- confirm PCA9685 shows at 0x40
+//    2. gpioinfo             <- confirm button pins are free
+//    3. Check MOTOR_CHANNELS in MotorControl.cpp matches your PCB
+//    4. Check PIN_* in Buttons.cpp matches your wiring
 // ============================================================
 
-#include "MotorControl.cpp"  // pulls in Mappers.cpp -> AudioEngine.cpp
+#include "MotorControl.cpp"  // -> Mappers.cpp -> AudioEngine.cpp
+#include "Buttons.cpp"
 
 #include <portaudio.h>
 #include <iostream>
@@ -28,66 +39,56 @@
 #include <csignal>
 #include <thread>
 #include <chrono>
+#include <cstring>
 
 
 // ─────────────────────────────────────────────────────────────
-//  Audio capture config
+//  Audio config
+//  256 samples @ 44100 Hz ~= 5.8 ms per callback.
+//  Increase FRAMES_PER_BUFFER to 512 if you get audio xruns
+//  on the Pi Zero (it has limited CPU compared to Pi 4).
 // ─────────────────────────────────────────────────────────────
 
-// Samples per PortAudio callback.  256 @ 44100 Hz ~= 5.8 ms.
-// Increase to 512 if you get xruns on the Pi Zero.
 static constexpr int  FRAMES_PER_BUFFER  = 256;
-
-// -1 = system default input device.
-// Run once with LIST_DEVICES = true to find your mic index,
-// then set INPUT_DEVICE_INDEX to that number.
-static constexpr int  INPUT_DEVICE_INDEX = -1;
-static constexpr bool LIST_DEVICES       = true;
+static constexpr int  INPUT_DEVICE_INDEX = -1;    // -1 = system default
+static constexpr bool LIST_DEVICES       = true;  // print mic list on startup
 
 
 // ─────────────────────────────────────────────────────────────
-//  System state  (written by button handlers, read by main loop)
+//  System state
 //
-//  These are defined here so the rest of the code can see them.
-//  When VolumeAndFunctionButtons.cpp is wired in:
-//    1. Remove the three definitions below.
-//    2. Add at the top of this file:
-//         extern std::atomic<bool> system_on;
-//         extern std::atomic<int>  current_volume;
-//         extern std::atomic<int>  current_function;
-//    3. The button file already defines them — no other changes needed.
+//  These atomics are the single source of truth for power,
+//  volume, and mode. Buttons.cpp writes them; main loop reads.
 //
-//  current_function mapping:
-//    1 = BandMapper      (rows buzz together by frequency group)
-//    2 = DirectMapper    (one band per motor, proportional intensity)
-//    3 = DirectionalMapper (two-mic ILD — falls back to Band until 2nd mic added)
+//  current_function:
+//    1 = BandMapper   (rows buzz together by frequency group)
+//    2 = DirectMapper (one band per motor, proportional intensity)
 // ─────────────────────────────────────────────────────────────
 
 std::atomic<bool> system_on        { true };
-std::atomic<int>  current_volume   { 50   };  // 0-100
-std::atomic<int>  current_function { 1    };  // start in BandMapper
+std::atomic<int>  current_volume   { 50   };  // 0-100, starts at 50%
+std::atomic<int>  current_function { 1    };  // starts in Band mode
 
 
 // ─────────────────────────────────────────────────────────────
-//  Mapper instances and selection table
-//  Add new mappers here — no other files need changing.
+//  Mapper instances
+//  Add new mappers here — MAPPER_TABLE and MAPPER_COUNT update
+//  automatically. current_function - 1 = index into this table.
 // ─────────────────────────────────────────────────────────────
 
-static BandMapper        bandMapper;
-static DirectMapper      directMapper;
-static DirectionalMapper directionalMapper;
+static BandMapper   bandMapper;
+static DirectMapper directMapper;
 
 static IMapper* const MAPPER_TABLE[] = {
-    &bandMapper,           // current_function == 1
-    &directMapper,         // current_function == 2
-    &directionalMapper,    // current_function == 3
+    &bandMapper,    // current_function == 1
+    &directMapper,  // current_function == 2
 };
 static constexpr int MAPPER_COUNT =
     static_cast<int>(sizeof(MAPPER_TABLE) / sizeof(MAPPER_TABLE[0]));
 
 
 // ─────────────────────────────────────────────────────────────
-//  Shared state  (audio thread <-> main thread)
+//  Shared audio state  (audio thread <-> main thread)
 //  Lock-free ping-pong — no mutexes in the audio callback.
 // ─────────────────────────────────────────────────────────────
 
@@ -153,32 +154,35 @@ static void printStatus(const FilterOutput&    out,
                         const MotorController& motors,
                         const IMapper*         mapper)
 {
-    std::cout << "\033[" << (BAND_COUNT + 4) << "A";
+    // Number of lines in the status block — must match lines printed below
+    static constexpr int STATUS_LINES = BAND_COUNT + 4;
+    std::cout << "\033[" << STATUS_LINES << "A";
 
-    std::cout << "Mode:   " << mapper->name()
-              << "                    \n";
-    std::cout << "Volume: " << current_volume.load()
-              << "%   Power: " << (system_on.load() ? "ON " : "OFF")
-              << "                    \n\n";
+    // Header
+    std::cout << "Mode:   " << std::left << std::setw(30)
+              << mapper->name()
+              << "Vol: " << std::setw(3) << current_volume.load() << "%"
+              << "  Pwr: " << (system_on.load() ? "ON " : "OFF")
+              << "          \n\n";
 
+    // Per-band: audio envelope bar + motor intensity value
     for (int b = 0; b < BAND_COUNT; ++b) {
         const float audioEnv = out[b].envelope;
         const float motorInt = cmd.intensity[b];
         const int   filled   = static_cast<int>(
             std::clamp(audioEnv, 0.0f, 1.0f) * 20.0f);
 
-        std::cout << std::left  << std::setw(26)
+        std::cout << std::left << std::setw(24)
                   << AudioEngine::bandName(b)
-                  << " audio["
-                  << std::string(filled, '#')
-                  << std::string(20 - filled, '-')
-                  << "] "
+                  << " [" << std::string(filled, '#')
+                           << std::string(20 - filled, '-') << "] "
                   << std::fixed << std::setprecision(3) << audioEnv
-                  << "  motor "
-                  << std::fixed << std::setprecision(3) << motorInt
-                  << "          \n";
+                  << "  m:" << std::setprecision(2) << motorInt
+                  << "     \n";
     }
 
+    // Motor intensity bar
+    std::cout << "\n";
     motors.printState(cmd);
     std::cout.flush();
 }
@@ -196,11 +200,19 @@ int main() {
     std::signal(SIGINT,  onSignal);
     std::signal(SIGTERM, onSignal);
 
-    // ── PCA9685 init ─────────────────────────────────────────
+    // ── PCA9685 motor controller ──────────────────────────────
     MotorController motors;
     if (!motors.init()) return 1;
 
-    // ── PortAudio init ────────────────────────────────────────
+    // ── GPIO button handler ───────────────────────────────────
+    ButtonManager buttons;
+    if (!buttons.start()) {
+        std::cerr << "[main] Button init failed — continuing without buttons.\n"
+                  << "  Check PIN_* values in Buttons.cpp match your wiring.\n";
+        // Non-fatal: system still works, just no physical buttons
+    }
+
+    // ── PortAudio ─────────────────────────────────────────────
     PaError err = Pa_Initialize();
     if (err != paNoError) {
         std::cerr << "PortAudio init failed: " << Pa_GetErrorText(err) << "\n";
@@ -246,11 +258,15 @@ int main() {
         Pa_CloseStream(stream); Pa_Terminate(); return 1;
     }
 
-    std::cout << "Running — Ctrl+C to stop\n\n";
+    std::cout << "Running — press buttons or Ctrl+C to stop\n\n";
+    // Reserve lines for status display
     for (int i = 0; i < BAND_COUNT + 4; ++i) std::cout << "\n";
 
     // ── Main loop (~30 Hz) ────────────────────────────────────
-    MotorCommand cmd;  // persisted across frames for output smoothing
+    // cmd is persistent across frames — output smoothing in the
+    // mappers needs memory between iterations.
+    MotorCommand cmd;
+    std::memset(cmd.intensity, 0, sizeof(cmd.intensity));
 
     while (gState.running.load(std::memory_order_relaxed)) {
 
@@ -258,12 +274,12 @@ int main() {
         const int rs = 1 - gState.writeSlot.load(std::memory_order_acquire);
         const FilterOutput out = gState.slots[rs];
 
-        // Select active mapper
+        // Select active mapper from current_function (set by mode button)
         const int funcIdx = std::clamp(
             current_function.load() - 1, 0, MAPPER_COUNT - 1);
         IMapper* activeMapper = MAPPER_TABLE[funcIdx];
 
-        // Power gate — silence everything when system is off
+        // Power gate — silence all motors when system is off
         if (!system_on.load()) {
             std::memset(cmd.intensity, 0, sizeof(cmd.intensity));
             motors.allOff();
@@ -272,14 +288,13 @@ int main() {
             continue;
         }
 
-        // Run the active mapper
-        // volume (0-100) scales all intensities proportionally
+        // Run active mapper — volume (0-100) scales all intensities
         activeMapper->map(out, current_volume.load(), cmd);
 
-        // Write PWM values to PCA9685
+        // Write PWM to PCA9685
         motors.update(cmd);
 
-        // Refresh console display
+        // Refresh console
         printStatus(out, cmd, motors, activeMapper);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
@@ -290,6 +305,7 @@ int main() {
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
     Pa_Terminate();
+    buttons.stop();
     motors.shutdown();
 
     return 0;

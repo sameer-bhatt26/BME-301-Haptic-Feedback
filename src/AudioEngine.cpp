@@ -18,26 +18,14 @@
 //  can use bands directly without aggregation math.
 //
 //  Frequency layout — logarithmically spaced, 50 Hz to 8000 Hz.
-//  Log spacing mirrors human perception: low-frequency differences
-//  are felt more acutely, so lower bands are narrower in Hz but
-//  equal in perceptual size.
-//
-//  To change band boundaries, edit FREQ_LOW / FREQ_HIGH.
+//  To change band boundaries edit FREQ_LOW / FREQ_HIGH.
 //  To manually set individual crossovers, replace the log-spacing
 //  loop in initFilters() with a hand-written edges[] array.
-//  BAND_COUNT drives everything else automatically.
-//
-//  Pipeline (per process() call):
-//    Raw PCM -> Pre-gain + Soft-clip -> DC Blocker
-//            -> Mains Notch Bank    -> Tonal Buzz Gate
-//            -> 12 x Band filters   -> FilterOutput
 // ============================================================
 
 
 // ─────────────────────────────────────────────────────────────
 //  Motor / band count
-//  Change MOTOR_ROWS or MOTORS_PER_ROW if your hardware changes.
-//  BAND_COUNT is derived automatically.
 // ─────────────────────────────────────────────────────────────
 
 static constexpr int MOTOR_ROWS     = 3;
@@ -50,24 +38,14 @@ static constexpr int BAND_COUNT     = MOTOR_ROWS * MOTORS_PER_ROW;  // 12
 // ─────────────────────────────────────────────────────────────
 
 static constexpr int   SAMPLE_RATE  = 44100;
-
-// Envelope follower — how quickly band energy tracks the audio.
-// Shorter attack = snappier onset response (good for haptics).
-// Longer release = smoother decay, avoids jittery PWM changes.
-static constexpr float ATTACK_TIME  = 0.002f;  // 2 ms
-static constexpr float RELEASE_TIME = 0.050f;  // 50 ms
-
-// Scale microphone input before filtering.
-// Increase if motors barely respond; decrease if they always fire.
-static constexpr float INPUT_GAIN   = 2.0f;
+static constexpr float ATTACK_TIME  = 0.002f;   // 2 ms  — onset response
+static constexpr float RELEASE_TIME = 0.050f;   // 50 ms — decay smoothing
+static constexpr float INPUT_GAIN   = 2.0f;     // mic sensitivity scale
 
 
 // ─────────────────────────────────────────────────────────────
 //  Mains hum rejection
 //  60 Hz for North America / Japan. Change to 50.0f elsewhere.
-//  Notches placed at every harmonic up to MAINS_MAX_HZ.
-//  MAINS_NOTCH_BW controls notch width in Hz — 2 Hz is narrow
-//  enough that nearby environmental sounds pass through.
 // ─────────────────────────────────────────────────────────────
 
 static constexpr float MAINS_HZ       = 60.0f;
@@ -77,17 +55,6 @@ static constexpr float MAINS_NOTCH_BW = 2.0f;
 
 // ─────────────────────────────────────────────────────────────
 //  Tonal buzz detector tuning
-//
-//  TRANSIENT_RATIO — short/long-term RMS ratio above which the
-//    signal is treated as a real event (impact, voice) and the
-//    gate is held open. Lower = opens more easily.
-//
-//  FLATNESS_THRESH — spectral flatness below this closes the gate.
-//    Construction rumble: ~0.4-0.7. Mains buzz: ~0.01-0.05.
-//    Raise if real sounds are being gated out.
-//
-//  GATE_FLOOR — minimum gain when gate is closed (~-22 dB at 0.08).
-//    Not a full mute — very loud buzz still carries some signal.
 // ─────────────────────────────────────────────────────────────
 
 static constexpr float TRANSIENT_RATIO = 2.5f;
@@ -99,15 +66,11 @@ static constexpr float GATE_RELEASE    = 0.080f;
 
 // ─────────────────────────────────────────────────────────────
 //  Frequency band range
-//  All 12 bands are log-spaced between these two values.
-//  Edit here to shift the entire sensing range.
 // ─────────────────────────────────────────────────────────────
 
 static constexpr float FREQ_LOW  =   50.0f;
 static constexpr float FREQ_HIGH = 8000.0f;
 
-// Human-readable band names for console display.
-// Update if BAND_COUNT changes.
 static constexpr const char* BAND_NAMES[BAND_COUNT] = {
     "Band 00  ( 50-  78 Hz)",
     "Band 01  ( 78- 122 Hz)",
@@ -125,14 +88,12 @@ static constexpr const char* BAND_NAMES[BAND_COUNT] = {
 
 
 // ─────────────────────────────────────────────────────────────
-//  FilterOutput  —  plain data, no logic
-//  Passed from AudioEngine to every mapper.
-//  Index [0] = lowest frequency band.
+//  FilterOutput
 // ─────────────────────────────────────────────────────────────
 
 struct BandResult {
-    float envelope = 0.0f;  // Smoothed energy, 0.0-1.0
-    float peak     = 0.0f;  // Instantaneous peak, 0.0-1.0
+    float envelope = 0.0f;
+    float peak     = 0.0f;
 };
 
 struct FilterOutput {
@@ -157,15 +118,14 @@ public:
         const float cosW0 = std::cos(w0);
         const float sinW0 = std::sin(w0);
         const float alpha = sinW0 / (2.0f * Q);
-
         float b0, b1, b2, a0, a1, a2;
         switch (type) {
             case LOW_PASS:
                 b0=(1-cosW0)/2; b1=1-cosW0; b2=(1-cosW0)/2;
-                a0=1+alpha;     a1=-2*cosW0; a2=1-alpha; break;
+                a0=1+alpha; a1=-2*cosW0; a2=1-alpha; break;
             case HIGH_PASS:
                 b0=(1+cosW0)/2; b1=-(1+cosW0); b2=(1+cosW0)/2;
-                a0=1+alpha;     a1=-2*cosW0;   a2=1-alpha; break;
+                a0=1+alpha; a1=-2*cosW0; a2=1-alpha; break;
             case NOTCH:
                 b0=1; b1=-2*cosW0; b2=1;
                 a0=1+alpha; a1=-2*cosW0; a2=1-alpha; break;
@@ -188,12 +148,12 @@ public:
     void reset() { z1_ = z2_ = 0.0f; }
 
 private:
-    float b0_=0, b1_=0, b2_=0, a1_=0, a2_=0, z1_=0, z2_=0;
+    float b0_=0,b1_=0,b2_=0,a1_=0,a2_=0,z1_=0,z2_=0;
 };
 
 
 // ─────────────────────────────────────────────────────────────
-//  DCBlocker  —  one-pole HP at ~10 Hz
+//  DCBlocker
 // ─────────────────────────────────────────────────────────────
 
 class DCBlocker {
@@ -246,65 +206,55 @@ public:
         ltRmsCoeff_   = 1.0f - std::exp(-1.0f / (sr * 0.3f));
         reset();
     }
-
     float analyse(const std::array<float, BAND_COUNT>& envs, float bufRms) {
         ltRms_ += ltRmsCoeff_ * (bufRms - ltRms_);
         const bool isTransient = (ltRms_ > 1e-6f) &&
                                  (bufRms / ltRms_ > TRANSIENT_RATIO);
-
-        float sumLin = 0, sumLog = 0;
-        int nActive = 0;
-        for (int b = 0; b < BAND_COUNT; ++b) {
+        float sumLin=0, sumLog=0; int nActive=0;
+        for (int b=0; b<BAND_COUNT; ++b) {
             const float e = envs[b];
-            if (e > 1e-7f) { sumLin += e; sumLog += std::log(e); ++nActive; }
+            if (e > 1e-7f) { sumLin+=e; sumLog+=std::log(e); ++nActive; }
         }
         float sfm = 1.0f;
         if (nActive > 1) {
-            const float geo = std::exp(sumLog / nActive);
-            const float ari = sumLin / nActive;
-            sfm = (ari > 1e-7f) ? geo / ari : 1.0f;
+            const float geo=std::exp(sumLog/nActive), ari=sumLin/nActive;
+            sfm = (ari > 1e-7f) ? geo/ari : 1.0f;
         }
-
         const float target = (!isTransient && sfm < FLATNESS_THRESH)
                                  ? GATE_FLOOR : 1.0f;
         const float coeff  = (target > gateGain_) ? attackCoeff_ : releaseCoeff_;
         gateGain_ += coeff * (target - gateGain_);
         return gateGain_;
     }
-
-    void reset() { gateGain_ = 1.0f; ltRms_ = 0.0f; }
-
+    void reset() { gateGain_=1.0f; ltRms_=0.0f; }
 private:
-    float attackCoeff_=0, releaseCoeff_=0, ltRmsCoeff_=0;
+    float attackCoeff_=0,releaseCoeff_=0,ltRmsCoeff_=0;
     float gateGain_=1.0f, ltRms_=0.0f;
 };
 
 
 // ─────────────────────────────────────────────────────────────
-//  PerBandFilter  —  4th-order Linkwitz-Riley per band
+//  PerBandFilter  —  4th-order Linkwitz-Riley
 // ─────────────────────────────────────────────────────────────
 
 struct PerBandFilter {
-    BiquadFilter lpA, lpB, hpA, hpB;
-    bool  hasHP = true, hasLP = true;
-    float envelope = 0.0f;
-    float attackCoeff = 0.0f, releaseCoeff = 0.0f;
+    BiquadFilter lpA,lpB,hpA,hpB;
+    bool  hasHP=true, hasLP=true;
+    float envelope=0.0f, attackCoeff=0.0f, releaseCoeff=0.0f;
 
     void configureEnvelope(float sr) {
         attackCoeff  = 1.0f - std::exp(-1.0f / (sr * ATTACK_TIME));
         releaseCoeff = 1.0f - std::exp(-1.0f / (sr * RELEASE_TIME));
     }
-
     inline std::pair<float,float> process(float x) {
         float y = x;
-        if (hasHP) { y = hpA.process(y); y = hpB.process(y); }
-        if (hasLP) { y = lpA.process(y); y = lpB.process(y); }
+        if (hasHP) { y=hpA.process(y); y=hpB.process(y); }
+        if (hasLP) { y=lpA.process(y); y=lpB.process(y); }
         const float absY = std::abs(y);
         if (absY > envelope) envelope += attackCoeff  * (absY - envelope);
         else                 envelope += releaseCoeff * (absY - envelope);
         return { y, envelope };
     }
-
     void reset() {
         lpA.reset(); lpB.reset(); hpA.reset(); hpB.reset();
         envelope = 0.0f;
@@ -321,9 +271,7 @@ public:
     AudioEngine() { initFilters(); }
 
     void configure(float sampleRate, float inputGain = INPUT_GAIN) {
-        sampleRate_ = sampleRate;
-        inputGain_  = inputGain;
-        initFilters();
+        sampleRate_ = sampleRate; inputGain_ = inputGain; initFilters();
     }
 
     FilterOutput process(const std::vector<float>& buf) {
@@ -331,17 +279,16 @@ public:
         std::array<float, BAND_COUNT> peakAcc; peakAcc.fill(0.0f);
 
         float sumSq = 0.0f;
-        for (float s : buf) sumSq += s * s;
+        for (float s : buf) sumSq += s*s;
         const float bufRms = std::sqrt(
-            sumSq / static_cast<float>(std::max(1, (int)buf.size())));
+            sumSq / static_cast<float>(std::max(1,(int)buf.size())));
 
         for (float raw : buf) {
             const float gained  = raw * inputGain_;
             const float clipped = std::tanh(gained);
             const float clean   = dcBlocker_.process(clipped);
             const float notched = mainsNotch_.process(clean);
-
-            for (int b = 0; b < BAND_COUNT; ++b) {
+            for (int b=0; b<BAND_COUNT; ++b) {
                 auto [filtered, env] = bands_[b].process(notched);
                 (void)env;
                 const float a = std::abs(filtered);
@@ -350,10 +297,10 @@ public:
         }
 
         std::array<float, BAND_COUNT> envSnap;
-        for (int b = 0; b < BAND_COUNT; ++b) envSnap[b] = bands_[b].envelope;
+        for (int b=0; b<BAND_COUNT; ++b) envSnap[b] = bands_[b].envelope;
         const float gate = buzzDetector_.analyse(envSnap, bufRms);
 
-        for (int b = 0; b < BAND_COUNT; ++b) {
+        for (int b=0; b<BAND_COUNT; ++b) {
             out[b].envelope = std::clamp(bands_[b].envelope * gate, 0.0f, 1.0f);
             out[b].peak     = std::clamp(peakAcc[b]         * gate, 0.0f, 1.0f);
         }
@@ -368,26 +315,23 @@ public:
     float sampleRate() const { return sampleRate_; }
 
     static const char* bandName(int b) {
-        return (b >= 0 && b < BAND_COUNT) ? BAND_NAMES[b] : "Unknown";
+        return (b>=0 && b<BAND_COUNT) ? BAND_NAMES[b] : "Unknown";
     }
 
 private:
     void initFilters() {
         const float sr = sampleRate_;
-
-        // Log-spaced crossover edges: edges[0]=FREQ_LOW, edges[12]=FREQ_HIGH
-        // To hard-code custom boundaries, replace this loop with a
-        // hand-written edges[] array and the rest picks it up automatically.
+        // Log-spaced crossover edges. To use custom boundaries,
+        // replace this loop with a hand-written edges[] array.
         float edges[BAND_COUNT + 1];
-        for (int i = 0; i <= BAND_COUNT; ++i) {
+        for (int i=0; i<=BAND_COUNT; ++i) {
             const float t = static_cast<float>(i) / BAND_COUNT;
             edges[i] = FREQ_LOW * std::pow(FREQ_HIGH / FREQ_LOW, t);
         }
-
-        for (int b = 0; b < BAND_COUNT; ++b) {
+        for (int b=0; b<BAND_COUNT; ++b) {
             auto& band = bands_[b];
             band.hasHP = (b > 0);
-            band.hasLP = (b < BAND_COUNT - 1);
+            band.hasLP = (b < BAND_COUNT-1);
             if (band.hasHP) {
                 band.hpA.configure(BiquadFilter::HIGH_PASS, edges[b],   sr);
                 band.hpB.configure(BiquadFilter::HIGH_PASS, edges[b],   sr);

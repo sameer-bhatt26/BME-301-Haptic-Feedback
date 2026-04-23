@@ -9,33 +9,25 @@
 //  Mappers.cpp
 //  Translates FilterOutput into per-motor PWM intensity values.
 //
-//  Now that the PCA9685 supports PWM, MotorCommand carries a
-//  float intensity per motor (0.0 = off, 1.0 = full vibration)
-//  instead of a simple bool.  This lets mappers express how
-//  strongly each motor should vibrate, not just whether it fires.
+//  Two mapping modes are implemented:
+//    1. BandMapper   — entire rows buzz together by frequency group
+//    2. DirectMapper — one band per motor, proportional intensity
 //
-//  All mappers share the IMapper interface so main.cpp can swap
-//  modes at runtime by changing one pointer:
+//  Both share the IMapper interface so main.cpp swaps modes by
+//  changing one pointer — no other code needs to change.
 //
-//      IMapper* active = &directMapper;
-//      active->map(filterOutput, volume, cmd);
+//  Motor layout (3 rows x 4 columns = 12 motors):
 //
-//  Motor layout — 3 rows x 4 columns = 12 motors:
-//
-//      Index:  0   1   2   3    <- row 0  low freq  (50-299 Hz)
-//              4   5   6   7    <- row 1  mid freq  (299-1796 Hz)
+//      Index:  0   1   2   3    <- row 0  low  freq (50-299 Hz)
+//              4   5   6   7    <- row 1  mid  freq (299-1796 Hz)
 //              8   9  10  11    <- row 2  high freq (1796-8000 Hz)
 // ============================================================
 
 
 // ─────────────────────────────────────────────────────────────
 //  MotorCommand  —  output from every mapper
-//
-//  intensity[m] is in [0.0, 1.0]:
-//    0.0  = motor fully off
-//    1.0  = motor at full vibration
-//    0.5  = motor at half intensity
-//
+//  intensity[m] in [0.0, 1.0]:
+//    0.0 = off,  1.0 = full vibration,  0.5 = half intensity
 //  MotorControl.cpp converts these to 12-bit PCA9685 values.
 // ─────────────────────────────────────────────────────────────
 
@@ -47,28 +39,26 @@ struct MotorCommand {
 // ─────────────────────────────────────────────────────────────
 //  Mapping constants
 //
-//  MOTOR_THRESHOLD — minimum scaled envelope to activate a motor.
-//    Below this, intensity is forced to 0 (motor stays still).
-//    Prevents micro-vibrations from background noise.
-//    Range 0.0-1.0.  Tune upward if motors hum in silence.
+//  MOTOR_THRESHOLD   — minimum scaled envelope to activate a motor.
+//                      Raise if motors hum in silence; lower if
+//                      they don't respond to quiet sounds.
 //
-//  MAX_MOTORS_ACTIVE — hard cap on simultaneously active motors.
-//    Limits peak current draw from the battery rail.
-//    With 12 x ERM at ~100 mA each, 8 simultaneous = 800 mA.
+//  MAX_MOTORS_ACTIVE — hard cap on simultaneous motors.
+//                      Limits peak current from the battery rail.
 //
-//  OUTPUT_SMOOTHING_COEFF — low-pass on the PWM output intensity.
-//    Prevents abrupt step changes in motor speed (audible clicking,
-//    mechanical stress).  Higher = faster response, more stepping.
-//    Range 0.0-1.0.  ~0.3 gives a ~33ms ramp at 30 Hz update rate.
+//  OUTPUT_SMOOTHING  — low-pass coefficient on PWM output.
+//                      Prevents abrupt motor speed steps.
+//                      0.3 gives ~33 ms ramp at 30 Hz update rate.
+//                      Range 0.0 (frozen) to 1.0 (no smoothing).
 // ─────────────────────────────────────────────────────────────
 
-static constexpr float MOTOR_THRESHOLD      = 0.05f;
-static constexpr int   MAX_MOTORS_ACTIVE    = 8;
-static constexpr float OUTPUT_SMOOTHING     = 0.3f;  // per 33 ms frame
+static constexpr float MOTOR_THRESHOLD   = 0.05f;
+static constexpr int   MAX_MOTORS_ACTIVE = 8;
+static constexpr float OUTPUT_SMOOTHING  = 0.3f;
 
 
 // ─────────────────────────────────────────────────────────────
-//  IMapper  —  base interface
+//  IMapper  —  base interface for all mapping modes
 // ─────────────────────────────────────────────────────────────
 
 class IMapper {
@@ -76,12 +66,9 @@ public:
     virtual ~IMapper() = default;
 
     /**
-     * @brief  Convert FilterOutput into per-motor PWM intensities.
-     *
-     * @param  input    FilterOutput from AudioEngine::process()
-     * @param  volume   User volume, 0-100.  Scales all intensities
-     *                  proportionally before threshold comparison.
-     * @param  cmd      Output: per-motor intensity in [0.0, 1.0].
+     * @param input   FilterOutput from AudioEngine::process()
+     * @param volume  User volume 0-100; scales all intensities.
+     * @param cmd     Output: per-motor intensity in [0.0, 1.0].
      */
     virtual void map(const FilterOutput& input,
                      int                 volume,
@@ -92,21 +79,18 @@ public:
 
 
 // ─────────────────────────────────────────────────────────────
-//  Shared helpers
+//  Shared helper — volume scale, threshold gate, cap, smoothing
+//  Call this at the end of every mapper's map() implementation.
 // ─────────────────────────────────────────────────────────────
 
-// Applies volume scaling, threshold gate, MAX_MOTORS_ACTIVE cap,
-// and output smoothing to a raw scores[] array.
-// scores[m] should be in [0, 1] before calling.
-// prevIntensity[m] is updated in-place for the smoothing filter.
-static void applyVolumeGateCapAndSmooth(const float  scores[BAND_COUNT],
-                                         int          volume,
-                                         float        prevIntensity[BAND_COUNT],
+static void applyVolumeGateCapAndSmooth(const float   scores[BAND_COUNT],
+                                         int           volume,
+                                         float         smoothed[BAND_COUNT],
                                          MotorCommand& cmd)
 {
     const float volScale = static_cast<float>(volume) / 100.0f;
 
-    // Collect motors above threshold, sorted by energy
+    // Collect motors above threshold, ranked by energy
     struct Candidate { int idx; float score; };
     Candidate candidates[BAND_COUNT];
     int nCandidates = 0;
@@ -117,75 +101,49 @@ static void applyVolumeGateCapAndSmooth(const float  scores[BAND_COUNT],
             candidates[nCandidates++] = { m, scaled };
     }
 
-    // Sort descending — strongest signal gets priority under the cap
+    // Sort descending — strongest signals get priority under the cap
     std::sort(candidates, candidates + nCandidates,
               [](const Candidate& a, const Candidate& b) {
                   return a.score > b.score;
               });
 
-    // Build target intensity array — only top MAX_MOTORS_ACTIVE fire
+    // Build target intensities — only top MAX_MOTORS_ACTIVE fire
     float target[BAND_COUNT] = {};
     const int limit = std::min(nCandidates, MAX_MOTORS_ACTIVE);
     for (int i = 0; i < limit; ++i)
         target[candidates[i].idx] = candidates[i].score;
 
-    // Smooth output — prevents abrupt PWM steps
+    // Smooth output to prevent abrupt PWM steps
     for (int m = 0; m < BAND_COUNT; ++m) {
-        prevIntensity[m] += OUTPUT_SMOOTHING * (target[m] - prevIntensity[m]);
-        cmd.intensity[m] = std::clamp(prevIntensity[m], 0.0f, 1.0f);
+        smoothed[m] += OUTPUT_SMOOTHING * (target[m] - smoothed[m]);
+        cmd.intensity[m] = std::clamp(smoothed[m], 0.0f, 1.0f);
     }
 }
 
 
 // ─────────────────────────────────────────────────────────────
-//  DirectMapper
+//  BandMapper  (function 1)
 //
-//  One band -> one motor, 1-to-1 in frequency order.
-//  Band 0 (lowest) drives motor 0; band 11 (highest) drives motor 11.
-//  Motor intensity is proportional to band envelope energy.
+//  All 4 motors in a row vibrate at equal intensity based on
+//  the average envelope across that row's frequency bands.
+//  Gives a simple "low / mid / high" feel — whole rows buzz
+//  together rather than individual motors.
 //
-//  Motor layout result:
-//    Row 0:  motors 0-3   <- bands 0-3   (50-299 Hz)
-//    Row 1:  motors 4-7   <- bands 4-7   (299-1796 Hz)
-//    Row 2:  motors 8-11  <- bands 8-11  (1796-8000 Hz)
-// ─────────────────────────────────────────────────────────────
-
-class DirectMapper : public IMapper {
-public:
-    void map(const FilterOutput& input, int volume, MotorCommand& cmd) override {
-        float scores[BAND_COUNT];
-        for (int m = 0; m < BAND_COUNT; ++m)
-            scores[m] = input[m].envelope;
-        applyVolumeGateCapAndSmooth(scores, volume, smoothed_, cmd);
-    }
-    const char* name() const override { return "Direct (1 band : 1 motor)"; }
-
-private:
-    float smoothed_[BAND_COUNT] = {};
-};
-
-
-// ─────────────────────────────────────────────────────────────
-//  BandMapper
+//  Row assignments:
+//    Row 0  ->  bands 0-3   (50-299 Hz)    motors 0-3
+//    Row 1  ->  bands 4-7   (299-1796 Hz)  motors 4-7
+//    Row 2  ->  bands 8-11  (1796-8000 Hz) motors 8-11
 //
-//  Groups all 4 motors in a row and drives them at equal intensity
-//  based on the average envelope across that row's bands.
-//  Gives a simpler "low / mid / high" sensation — entire rows
-//  buzz together rather than individual motors.
-//
-//  Row band assignments:
-//    Row 0  ->  bands 0-3   (low)
-//    Row 1  ->  bands 4-7   (mid)
-//    Row 2  ->  bands 8-11  (high)
-//
-//  To change which bands belong to which row, edit ROW_BAND_START
-//  and ROW_BAND_END.  They must cover all BAND_COUNT bands with
-//  no overlap or gaps.
+//  To change which bands belong to which row, edit
+//  ROW_BAND_START and ROW_BAND_END below only.
 // ─────────────────────────────────────────────────────────────
 
 class BandMapper : public IMapper {
 public:
-    // First and last band index (inclusive) for each motor row
+    // ── Row band assignments ─────────────────────────────────
+    // ROW_BAND_START[r] = first band index for row r (inclusive)
+    // ROW_BAND_END[r]   = last  band index for row r (inclusive)
+    // Must cover all BAND_COUNT bands, no gaps, no overlaps.
     static constexpr int ROW_BAND_START[MOTOR_ROWS] = { 0, 4, 8  };
     static constexpr int ROW_BAND_END  [MOTOR_ROWS] = { 3, 7, 11 };
 
@@ -193,6 +151,7 @@ public:
         float scores[BAND_COUNT] = {};
 
         for (int row = 0; row < MOTOR_ROWS; ++row) {
+            // Average envelope across all bands in this row
             float rowEnergy = 0.0f;
             const int nBands = ROW_BAND_END[row] - ROW_BAND_START[row] + 1;
             for (int b = ROW_BAND_START[row]; b <= ROW_BAND_END[row]; ++b)
@@ -208,7 +167,7 @@ public:
         applyVolumeGateCapAndSmooth(scores, volume, smoothed_, cmd);
     }
 
-    const char* name() const override { return "Band (row grouping)"; }
+    const char* name() const override { return "Mode 1: Band (rows)"; }
 
 private:
     float smoothed_[BAND_COUNT] = {};
@@ -216,79 +175,30 @@ private:
 
 
 // ─────────────────────────────────────────────────────────────
-//  DirectionalMapper  (two-microphone mode)
+//  DirectMapper  (function 2)
 //
-//  Requires two AudioEngine instances — one per mic.
-//  Compares per-row energy between left and right mics to compute
-//  an inter-aural level difference (ILD) weight.
+//  One band drives one motor in frequency order.
+//  Motor intensity is proportional to that band's envelope.
+//  Gives the most granular spatial representation of the audio
+//  spectrum — lower sleeve = lower frequencies, higher = higher.
 //
-//  Left motors  = columns 0, 1 within each row
-//  Right motors = columns 2, 3 within each row
-//
-//  If the left mic is louder for a row, left-side motors in that
-//  row vibrate proportionally harder, and vice versa.
-//
-//  To change left/right column assignments, edit LEFT_COLS and
-//  RIGHT_COLS below.
-//
-//  Single-mic fallback: falls back to BandMapper so this mapper
-//  can be selected even before a second mic is wired up.
+//  Result:
+//    Row 0: motors 0-3  <- bands 0-3  (50-299 Hz)
+//    Row 1: motors 4-7  <- bands 4-7  (299-1796 Hz)
+//    Row 2: motors 8-11 <- bands 8-11 (1796-8000 Hz)
 // ─────────────────────────────────────────────────────────────
 
-class DirectionalMapper : public IMapper {
+class DirectMapper : public IMapper {
 public:
-    // Column indices (within each row) assigned to each side
-    static constexpr int LEFT_COLS [2] = { 0, 1 };
-    static constexpr int RIGHT_COLS[2] = { 2, 3 };
-
-    // Row band ranges — must match BandMapper
-    static constexpr int ROW_BAND_START[MOTOR_ROWS] = { 0, 4, 8  };
-    static constexpr int ROW_BAND_END  [MOTOR_ROWS] = { 3, 7, 11 };
-
-    // Two-mic version — call this when you have two AudioEngine instances
-    void map(const FilterOutput& leftInput,
-             const FilterOutput& rightInput,
-             int                 volume,
-             MotorCommand&       cmd)
-    {
-        float scores[BAND_COUNT] = {};
-
-        for (int row = 0; row < MOTOR_ROWS; ++row) {
-            float leftEnergy = 0.0f, rightEnergy = 0.0f;
-            const int nBands = ROW_BAND_END[row] - ROW_BAND_START[row] + 1;
-
-            for (int b = ROW_BAND_START[row]; b <= ROW_BAND_END[row]; ++b) {
-                leftEnergy  += leftInput[b].envelope;
-                rightEnergy += rightInput[b].envelope;
-            }
-            leftEnergy  /= static_cast<float>(nBands);
-            rightEnergy /= static_cast<float>(nBands);
-
-            const float total       = leftEnergy + rightEnergy;
-            const float leftWeight  = (total > 1e-6f) ? leftEnergy  / total : 0.5f;
-            const float rightWeight = (total > 1e-6f) ? rightEnergy / total : 0.5f;
-
-            for (int col : LEFT_COLS) {
-                const int m = row * MOTORS_PER_ROW + col;
-                scores[m] = leftEnergy * leftWeight;
-            }
-            for (int col : RIGHT_COLS) {
-                const int m = row * MOTORS_PER_ROW + col;
-                scores[m] = rightEnergy * rightWeight;
-            }
-        }
-
+    void map(const FilterOutput& input, int volume, MotorCommand& cmd) override {
+        float scores[BAND_COUNT];
+        for (int m = 0; m < BAND_COUNT; ++m)
+            scores[m] = input[m].envelope;
         applyVolumeGateCapAndSmooth(scores, volume, smoothed_, cmd);
     }
 
-    // Single-mic fallback — delegates to BandMapper
-    void map(const FilterOutput& input, int volume, MotorCommand& cmd) override {
-        fallback_.map(input, volume, cmd);
-    }
-
-    const char* name() const override { return "Directional (2-mic ILD)"; }
+    const char* name() const override { return "Mode 2: Direct (1:1)"; }
 
 private:
-    BandMapper fallback_;
-    float      smoothed_[BAND_COUNT] = {};
+    float smoothed_[BAND_COUNT] = {};
 };
