@@ -82,19 +82,22 @@ static constexpr int     PWM_MAX         = 4095;
 //  no other file needs to change.
 // ─────────────────────────────────────────────────────────────
 
-static constexpr std::array<int, BAND_COUNT> MOTOR_CHANNELS = {
-     0,   // Motor  0  — row 0, col 0  — PCA9685 ch 0
-     1,   // Motor  1  — row 0, col 1  — PCA9685 ch 1
-     2,   // Motor  2  — row 0, col 2  — PCA9685 ch 2
-     3,   // Motor  3  — row 0, col 3  — PCA9685 ch 3
-     4,   // Motor  4  — row 1, col 0  — PCA9685 ch 4
-     5,   // Motor  5  — row 1, col 1  — PCA9685 ch 5
-     8,   // Motor  6  — row 1, col 2  — PCA9685 ch 8  (ch 6 & 7 skipped)
-     9,   // Motor  7  — row 1, col 3  — PCA9685 ch 9
-    10,   // Motor  8  — row 2, col 0  — PCA9685 ch 10
-    11,   // Motor  9  — row 2, col 1  — PCA9685 ch 11
-    12,   // Motor 10  — row 2, col 2  — PCA9685 ch 12
-    13,   // Motor 11  — row 2, col 3  — PCA9685 ch 13
+static constexpr std::array<int, 12> MOTOR_CHANNELS = {
+    // Row 0 — elbow — low freq  (motors 6,1,0,7 -> ch 8,1,0,9)
+    8,   // index 0
+    1,   // index 1
+    0,   // index 2
+    9,   // index 3
+    // Row 1 — mid freq  (motors 8,2,3,9 -> ch 10,2,3,11)
+    10,  // index 4
+    2,   // index 5
+    3,   // index 6
+    11,  // index 7
+    // Row 2 — wrist — high freq  (motors 10,5,4,11 -> ch 12,5,4,13)
+    12,  // index 8
+    5,   // index 9
+    4,   // index 10
+    13,  // index 11
 };
 
 static constexpr int MOTOR_COUNT = static_cast<int>(MOTOR_CHANNELS.size());
@@ -119,7 +122,7 @@ static_assert(MOTOR_COUNT == BAND_COUNT,
 // ─────────────────────────────────────────────────────────────
 
 static constexpr int OVERDRIVE_FRAMES = 1;     // ~33 ms kickstart
-static constexpr int MIN_SPIN_DUTY    = 512;   // ~12.5% minimum
+static constexpr int MIN_SPIN_DUTY    = 256;   // ~12.5% minimum
 
 
 // ─────────────────────────────────────────────────────────────

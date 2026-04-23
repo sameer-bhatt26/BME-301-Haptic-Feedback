@@ -40,7 +40,7 @@ static constexpr int BAND_COUNT     = MOTOR_ROWS * MOTORS_PER_ROW;  // 12
 static constexpr int   SAMPLE_RATE  = 44100;
 static constexpr float ATTACK_TIME  = 0.002f;   // 2 ms  — onset response
 static constexpr float RELEASE_TIME = 0.050f;   // 50 ms — decay smoothing
-static constexpr float INPUT_GAIN   = 2.0f;     // mic sensitivity scale
+static constexpr float INPUT_GAIN   = 10.0f;     // mic sensitivity scale
 
 
 // ─────────────────────────────────────────────────────────────

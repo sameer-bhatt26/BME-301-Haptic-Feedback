@@ -56,9 +56,9 @@ extern std::atomic<int>  current_function;
 // ─────────────────────────────────────────────────────────────
 
 static constexpr int PIN_POWER     = 16;  // !! NOT BEING USED
-static constexpr int PIN_VOL_UP    = 26;  // !! UPDATE
-static constexpr int PIN_VOL_DOWN  = 13;  // !! UPDATE
-static constexpr int PIN_MODE      = 20;  // !! UPDATE
+static constexpr int PIN_VOL_UP    = 19;  // !! UPDATE
+static constexpr int PIN_VOL_DOWN  = 6;  // !! UPDATE
+static constexpr int PIN_MODE      = 20;  // !! CLOSEST TO THE BATTERY
 
 
 // ─────────────────────────────────────────────────────────────
@@ -229,7 +229,7 @@ private:
         };
 
         int  prevLevel[4] = { 1, 1, 1, 1 };  // idle = HIGH (pull-up)
-        auto lastTrigger[4] = { Clock::now(), Clock::now(),
+        std::chrono::steady_clock::time_point lastTrigger[4] = { Clock::now(), Clock::now(),
                                 Clock::now(), Clock::now() };
 
         while (running_) {

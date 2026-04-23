@@ -16,11 +16,14 @@
 //  Both share the IMapper interface so main.cpp swaps modes by
 //  changing one pointer — no other code needs to change.
 //
-//  Motor layout (3 rows x 4 columns = 12 motors):
+//  Physical motor layout (palm down, top of arm, wrist at top):
 //
-//      Index:  0   1   2   3    <- row 0  low  freq (50-299 Hz)
-//              4   5   6   7    <- row 1  mid  freq (299-1796 Hz)
-//              8   9  10  11    <- row 2  high freq (1796-8000 Hz)
+//      Wrist →  10 |  5 |  4 | 11    row 2  high freq (1796-8000 Hz)
+//                8 |  2 |  3 |  9    row 1  mid  freq (299-1796 Hz)
+//      Elbow →   6 |  1 |  0 |  7    row 0  low  freq (50-299 Hz)
+//
+//  Motor index -> PCA9685 channel mapping lives in MotorControl.cpp.
+//  Band->row assignments live in BandMapper below.
 // ============================================================
 
 
@@ -39,22 +42,34 @@ struct MotorCommand {
 // ─────────────────────────────────────────────────────────────
 //  Mapping constants
 //
-//  MOTOR_THRESHOLD   — minimum scaled envelope to activate a motor.
-//                      Raise if motors hum in silence; lower if
-//                      they don't respond to quiet sounds.
+//  MOTOR_THRESHOLD     — minimum scaled envelope to activate a motor.
+//                        Raise if motors hum in silence; lower if
+//                        they don't respond to quiet sounds.
 //
-//  MAX_MOTORS_ACTIVE — hard cap on simultaneous motors.
-//                      Limits peak current from the battery rail.
+//  MAX_CURRENT_MA      — hard current budget in milliamps.
+//                        Motors are admitted in descending energy
+//                        order until adding the next one would
+//                        exceed this budget. Prevents regulator
+//                        (LD1117) from being overloaded.
+//                        LD1117 max: ~800 mA. Pi + PCA9685 draw
+//                        ~150-200 mA at rest, so 500 mA leaves
+//                        comfortable headroom.
 //
-//  OUTPUT_SMOOTHING  — low-pass coefficient on PWM output.
-//                      Prevents abrupt motor speed steps.
-//                      0.3 gives ~33 ms ramp at 30 Hz update rate.
-//                      Range 0.0 (frozen) to 1.0 (no smoothing).
+//  MOTOR_CURRENT_MA    — current drawn by one motor at 100% duty.
+//                        At partial duty, actual draw scales
+//                        proportionally (PWM average current).
+//                        Measure your specific ERM; 50 mA is typical.
+//
+//  OUTPUT_SMOOTHING    — low-pass coefficient on PWM output.
+//                        Prevents abrupt motor speed steps.
+//                        0.3 gives ~33 ms ramp at 30 Hz update rate.
+//                        Range 0.0 (frozen) to 1.0 (no smoothing).
 // ─────────────────────────────────────────────────────────────
 
-static constexpr float MOTOR_THRESHOLD   = 0.05f;
-static constexpr int   MAX_MOTORS_ACTIVE = 8;
-static constexpr float OUTPUT_SMOOTHING  = 0.3f;
+static constexpr float MOTOR_THRESHOLD  = 0.05f;
+static constexpr float MAX_CURRENT_MA   = 500.0f;  // safe ceiling for LD1117
+static constexpr float MOTOR_CURRENT_MA = 50.0f;   // per motor at 100% duty
+static constexpr float OUTPUT_SMOOTHING = 0.6f;
 
 
 // ─────────────────────────────────────────────────────────────
@@ -79,18 +94,28 @@ public:
 
 
 // ─────────────────────────────────────────────────────────────
-//  Shared helper — volume scale, threshold gate, cap, smoothing
+//  Shared helper — volume scale, threshold gate, current budget,
+//  deterministic sort, and output smoothing.
 //  Call this at the end of every mapper's map() implementation.
+//
+//  Current budget logic:
+//    Motors are sorted strongest-first. They are admitted one by
+//    one until adding the next motor's estimated draw (intensity
+//    * MOTOR_CURRENT_MA) would exceed MAX_CURRENT_MA. This means:
+//      - At low amplitudes more motors can fire simultaneously.
+//      - At full amplitude fewer motors fire, protecting the LDO.
+//      - Ties in score are broken by motor index (deterministic),
+//        so the same motors always win — no random flickering.
 // ─────────────────────────────────────────────────────────────
 
-static void applyVolumeGateCapAndSmooth(const float   scores[BAND_COUNT],
-                                         int           volume,
-                                         float         smoothed[BAND_COUNT],
-                                         MotorCommand& cmd)
+static void applyVolumeGateCurrentAndSmooth(const float   scores[BAND_COUNT],
+                                             int           volume,
+                                             float         smoothed[BAND_COUNT],
+                                             MotorCommand& cmd)
 {
     const float volScale = static_cast<float>(volume) / 100.0f;
 
-    // Collect motors above threshold, ranked by energy
+    // Collect motors above threshold
     struct Candidate { int idx; float score; };
     Candidate candidates[BAND_COUNT];
     int nCandidates = 0;
@@ -101,17 +126,26 @@ static void applyVolumeGateCapAndSmooth(const float   scores[BAND_COUNT],
             candidates[nCandidates++] = { m, scaled };
     }
 
-    // Sort descending — strongest signals get priority under the cap
+    // Sort descending by score — break ties by motor index so the
+    // same motors always win (no frame-to-frame flickering in BandMapper
+    // where all motors in a row share the same score).
     std::sort(candidates, candidates + nCandidates,
               [](const Candidate& a, const Candidate& b) {
-                  return a.score > b.score;
+                  return a.score != b.score ? a.score > b.score
+                                           : a.idx   < b.idx;
               });
 
-    // Build target intensities — only top MAX_MOTORS_ACTIVE fire
+    // Admit motors in priority order until current budget is exhausted.
+    // Actual draw per motor = intensity * MOTOR_CURRENT_MA (PWM average).
     float target[BAND_COUNT] = {};
-    const int limit = std::min(nCandidates, MAX_MOTORS_ACTIVE);
-    for (int i = 0; i < limit; ++i)
+    float budgetUsed = 0.0f;
+
+    for (int i = 0; i < nCandidates; ++i) {
+        const float motorCurrent = candidates[i].score * MOTOR_CURRENT_MA;
+        if (budgetUsed + motorCurrent > MAX_CURRENT_MA) break;
         target[candidates[i].idx] = candidates[i].score;
+        budgetUsed += motorCurrent;
+    }
 
     // Smooth output to prevent abrupt PWM steps
     for (int m = 0; m < BAND_COUNT; ++m) {
@@ -122,28 +156,36 @@ static void applyVolumeGateCapAndSmooth(const float   scores[BAND_COUNT],
 
 
 // ─────────────────────────────────────────────────────────────
-//  BandMapper  (function 1)
+//  BandMapper  (mode 1)
 //
-//  All 4 motors in a row vibrate at equal intensity based on
-//  the average envelope across that row's frequency bands.
-//  Gives a simple "low / mid / high" feel — whole rows buzz
-//  together rather than individual motors.
+//  All 4 motors in a physical row vibrate at equal intensity
+//  based on the average envelope across that row's frequency
+//  bands. Gives a simple "low / mid / high" feel.
 //
-//  Row assignments:
-//    Row 0  ->  bands 0-3   (50-299 Hz)    motors 0-3
-//    Row 1  ->  bands 4-7   (299-1796 Hz)  motors 4-7
-//    Row 2  ->  bands 8-11  (1796-8000 Hz) motors 8-11
+//  Physical row -> motor index mapping (from arm diagram):
+//    Row 0  elbow/low  freq  ->  motors 6, 1, 0, 7
+//    Row 1  mid        freq  ->  motors 8, 2, 3, 9
+//    Row 2  wrist/high freq  ->  motors 10, 5, 4, 11
 //
-//  To change which bands belong to which row, edit
-//  ROW_BAND_START and ROW_BAND_END below only.
+//  Band -> row assignments:
+//    Row 0  ->  bands 0-3   (50-299 Hz)
+//    Row 1  ->  bands 4-7   (299-1796 Hz)
+//    Row 2  ->  bands 8-11  (1796-8000 Hz)
+//
+//  To change which bands map to which row, edit ROW_BANDS only.
 // ─────────────────────────────────────────────────────────────
 
 class BandMapper : public IMapper {
 public:
-    // ── Row band assignments ─────────────────────────────────
-    // ROW_BAND_START[r] = first band index for row r (inclusive)
-    // ROW_BAND_END[r]   = last  band index for row r (inclusive)
-    // Must cover all BAND_COUNT bands, no gaps, no overlaps.
+    // Physical row -> motor indices (from arm diagram)
+    // Row 0 = elbow (low), Row 1 = mid, Row 2 = wrist (high)
+    static constexpr int ROW_MOTORS[MOTOR_ROWS][MOTORS_PER_ROW] = {
+        { 6, 1, 0, 7  },   // row 0 — low  freq — elbow
+        { 8, 2, 3, 9  },   // row 1 — mid  freq
+        { 10, 5, 4, 11 },  // row 2 — high freq — wrist
+    };
+
+    // Band range per row (inclusive)
     static constexpr int ROW_BAND_START[MOTOR_ROWS] = { 0, 4, 8  };
     static constexpr int ROW_BAND_END  [MOTOR_ROWS] = { 3, 7, 11 };
 
@@ -158,13 +200,12 @@ public:
                 rowEnergy += input[b].envelope;
             rowEnergy /= static_cast<float>(nBands);
 
-            // All 4 motors in this row get the same intensity
-            const int motorStart = row * MOTORS_PER_ROW;
-            for (int m = motorStart; m < motorStart + MOTORS_PER_ROW; ++m)
-                scores[m] = rowEnergy;
+            // All 4 motors in this physical row get the same intensity
+            for (int col = 0; col < MOTORS_PER_ROW; ++col)
+                scores[ROW_MOTORS[row][col]] = rowEnergy;
         }
 
-        applyVolumeGateCapAndSmooth(scores, volume, smoothed_, cmd);
+        applyVolumeGateCurrentAndSmooth(scores, volume, smoothed_, cmd);
     }
 
     const char* name() const override { return "Mode 1: Band (rows)"; }
@@ -175,17 +216,17 @@ private:
 
 
 // ─────────────────────────────────────────────────────────────
-//  DirectMapper  (function 2)
+//  DirectMapper  (mode 2)
 //
 //  One band drives one motor in frequency order.
 //  Motor intensity is proportional to that band's envelope.
 //  Gives the most granular spatial representation of the audio
-//  spectrum — lower sleeve = lower frequencies, higher = higher.
+//  spectrum — elbow = lower frequencies, wrist = higher.
 //
-//  Result:
-//    Row 0: motors 0-3  <- bands 0-3  (50-299 Hz)
-//    Row 1: motors 4-7  <- bands 4-7  (299-1796 Hz)
-//    Row 2: motors 8-11 <- bands 8-11 (1796-8000 Hz)
+//  Band -> motor index is 1:1 in index order:
+//    Bands  0-3  -> motors  0-3   (low freq)
+//    Bands  4-7  -> motors  4-7   (mid freq)
+//    Bands  8-11 -> motors  8-11  (high freq)
 // ─────────────────────────────────────────────────────────────
 
 class DirectMapper : public IMapper {
@@ -194,7 +235,7 @@ public:
         float scores[BAND_COUNT];
         for (int m = 0; m < BAND_COUNT; ++m)
             scores[m] = input[m].envelope;
-        applyVolumeGateCapAndSmooth(scores, volume, smoothed_, cmd);
+        applyVolumeGateCurrentAndSmooth(scores, volume, smoothed_, cmd);
     }
 
     const char* name() const override { return "Mode 2: Direct (1:1)"; }
