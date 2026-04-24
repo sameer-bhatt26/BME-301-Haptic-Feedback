@@ -67,7 +67,7 @@ static constexpr bool LIST_DEVICES       = true;  // print mic list on startup
 
 std::atomic<bool> system_on        { true };
 std::atomic<int>  current_volume   { 50   };  // 0-100, starts at 50%
-std::atomic<int>  current_function { 1    };  // starts in Band mode
+std::atomic<int>  current_function { 2    };  // starts in Band mode
 
 
 // ─────────────────────────────────────────────────────────────

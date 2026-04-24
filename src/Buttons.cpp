@@ -76,7 +76,7 @@ static constexpr int PIN_MODE      = 20;  // !! CLOSEST TO THE BATTERY
 //                  1 = button pulls to VCC (pull-down wiring)
 // ─────────────────────────────────────────────────────────────
 
-static constexpr int  VOLUME_STEP  = 10;
+static constexpr int  VOLUME_STEP  = 5;
 static constexpr int  VOLUME_MIN   = 0;
 static constexpr int  VOLUME_MAX   = 100;
 static constexpr int  NUM_MODES    = 2;    // Band=1, Direct=2

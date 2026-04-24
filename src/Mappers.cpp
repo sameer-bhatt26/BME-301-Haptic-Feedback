@@ -113,7 +113,7 @@ static void applyVolumeGateCurrentAndSmooth(const float   scores[BAND_COUNT],
                                              float         smoothed[BAND_COUNT],
                                              MotorCommand& cmd)
 {
-    const float volScale = static_cast<float>(volume) / 100.0f;
+    const float volScale = 0.2f + (static_cast<float>(volume) / 100.0f) * 0.8f;
 
     // Collect motors above threshold
     struct Candidate { int idx; float score; };

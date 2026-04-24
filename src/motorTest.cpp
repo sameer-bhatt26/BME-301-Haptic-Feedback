@@ -49,18 +49,21 @@ static constexpr uint8_t MODE1_ALLCALL = 0x01;
 
 // Motor -> PCA9685 channel map (from MotorControl.cpp)
 static constexpr std::array<int, 12> MOTOR_CHANNELS = {
-     0,  // Motor  0 — row 0, col 0
-     1,  // Motor  1 — row 0, col 1
-     2,  // Motor  2 — row 0, col 2
-     3,  // Motor  3 — row 0, col 3
-     4,  // Motor  4 — row 1, col 0
-     5,  // Motor  5 — row 1, col 1
-     8,  // Motor  6 — row 1, col 2  (ch 6 & 7 skipped)
-     9,  // Motor  7 — row 1, col 3
-    10,  // Motor  8 — row 2, col 0
-    11,  // Motor  9 — row 2, col 1
-    12,  // Motor 10 — row 2, col 2
-    13,  // Motor 11 — row 2, col 3
+    // Row 0 — elbow — low freq  (motors 6,1,0,7 -> ch 8,1,0,9)
+    8,   // index 0
+    1,   // index 1
+    0,   // index 2
+    9,   // index 3
+    // Row 1 — mid freq  (motors 8,2,3,9 -> ch 10,2,3,11)
+    10,  // index 4
+    2,   // index 5
+    3,   // index 6
+    11,  // index 7
+    // Row 2 — wrist — high freq  (motors 10,5,4,11 -> ch 12,5,4,13)
+    12,  // index 8
+    5,   // index 9
+    4,   // index 10
+    13,  // index 11
 };
 
 // Test amplitudes as fractions of PWM_MAX

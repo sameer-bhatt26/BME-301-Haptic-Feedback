@@ -83,21 +83,18 @@ static constexpr int     PWM_MAX         = 4095;
 // ─────────────────────────────────────────────────────────────
 
 static constexpr std::array<int, 12> MOTOR_CHANNELS = {
-    // Row 0 — elbow — low freq  (motors 6,1,0,7 -> ch 8,1,0,9)
-    8,   // index 0
-    1,   // index 1
-    0,   // index 2
-    9,   // index 3
-    // Row 1 — mid freq  (motors 8,2,3,9 -> ch 10,2,3,11)
-    10,  // index 4
-    2,   // index 5
-    3,   // index 6
-    11,  // index 7
-    // Row 2 — wrist — high freq  (motors 10,5,4,11 -> ch 12,5,4,13)
-    12,  // index 8
-    5,   // index 9
-    4,   // index 10
-    13,  // index 11
+     0,  // index 0  -> ch 0
+     1,  // index 1  -> ch 1
+     2,  // index 2  -> ch 2
+     3,  // index 3  -> ch 3
+     4,  // index 4  -> ch 4
+     5,  // index 5  -> ch 5
+     8,  // index 6  -> ch 8  (ch 6 & 7 skipped)
+     9,  // index 7  -> ch 9
+    10,  // index 8  -> ch 10
+    11,  // index 9  -> ch 11
+    12,  // index 10 -> ch 12
+    13,  // index 11 -> ch 13
 };
 
 static constexpr int MOTOR_COUNT = static_cast<int>(MOTOR_CHANNELS.size());
@@ -121,7 +118,7 @@ static_assert(MOTOR_COUNT == BAND_COUNT,
 //                      512 ~= 12.5% duty cycle.
 // ─────────────────────────────────────────────────────────────
 
-static constexpr int OVERDRIVE_FRAMES = 1;     // ~33 ms kickstart
+static constexpr int OVERDRIVE_FRAMES = 0;     // ~33 ms kickstart
 static constexpr int MIN_SPIN_DUTY    = 256;   // ~12.5% minimum
 
 
